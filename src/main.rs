@@ -73,7 +73,9 @@ fn main() {
     // Iterate all input elfs. Convert them to Tock friendly binaries and then
     // add them to the TAB file.
     for elf_file in opt.input {
-        let elffile = elf::File::open_path(&elf_file.path).expect("Could not open the .elf file.");
+        let elf_file_buf = std::fs::read(&elf_file.path).expect("Could not read the .elf file.");
+        let elffile = elf::ElfBytes::minimal_parse(elf_file_buf.as_slice())
+            .expect("Could not open the .elf file.");
 
         // The TBF will be written to the same place as the ELF, with a .tbf
         // extension.
@@ -124,7 +126,7 @@ fn main() {
         // for a list).
         //
         // RISC-V apps do not need to be sized to power of two.
-        let add_trailing_padding = elffile.ehdr.machine.0 == 0x28;
+        let add_trailing_padding = elffile.ehdr.e_machine == elf::abi::EM_ARM;
 
         // Do the conversion to a tock binary.
         if opt.verbose {

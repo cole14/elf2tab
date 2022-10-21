@@ -1,5 +1,6 @@
 use crate::header;
 use crate::util::{self, align_to, amount_alignment_needed};
+use elf::{endian::AnyEndian, ElfBytes};
 use ring::{rand, signature};
 use rsa_der;
 use sha2::{Digest, Sha256, Sha384, Sha512};
@@ -32,7 +33,7 @@ fn read_rsa_file(path: &std::path::Path) -> Result<Vec<u8>, std::io::Error> {
 ///   required RAM.
 /// - Sections that are writeable flash regions include .wfr in their name.
 pub fn elf_to_tbf(
-    input: &elf::File,
+    input: &ElfBytes<AnyEndian>,
     output: &mut Vec<u8>,
     package_name: Option<String>,
     verbose: bool,
@@ -55,20 +56,44 @@ pub fn elf_to_tbf(
 ) -> io::Result<()> {
     let package_name = package_name.unwrap_or_default();
 
+    let (shdr_tab, strtab) = match input.section_headers_with_strtab() {
+        Ok((Some(shdr_tab), Some(strtab))) => (shdr_tab, strtab),
+        _ => {
+            panic!("Cannot convert ELF file with no section headers");
+        }
+    };
+    let elf_shdrs: Vec<(String, elf::section::SectionHeader)> = shdr_tab
+        .iter()
+        .map(|shdr| {
+            (
+                strtab
+                    .get(shdr.sh_name as usize)
+                    .expect("Failed to parse section name")
+                    .to_string(),
+                shdr,
+            )
+        })
+        .collect();
+    let elf_phdrs: Vec<elf::segment::ProgramHeader> = input
+        .segments()
+        .expect("Failed to locate ELF program headers")
+        .iter()
+        .collect();
+
     // Get an array of the sections sorted so we place them in the proper order
     // in the binary.
     let mut sections_sort: Vec<(usize, usize)> = Vec::new();
-    for (i, section) in input.sections.iter().enumerate() {
-        sections_sort.push((i, section.shdr.offset as usize));
+    for (i, (_, shdr)) in elf_shdrs.iter().enumerate() {
+        sections_sort.push((i, shdr.sh_offset as usize));
     }
     sections_sort.sort_by_key(|s| s.1);
 
     let stack_len = stack_len
         // not provided, read from binary
         .or_else(|| {
-            input.sections.iter().find_map(|section| {
-                if section.shdr.name == ".stack" {
-                    Some(section.shdr.size as u32)
+            elf_shdrs.iter().find_map(|(sh_name, shdr)| {
+                if sh_name == ".stack" {
+                    Some(shdr.sh_size as u32)
                 } else {
                     None
                 }
@@ -84,19 +109,19 @@ pub fn elf_to_tbf(
     // These are set in the linker file to consume memory, and we need to
     // account for them when we set the minimum amount of memory this app
     // requires.
-    for segment in &input.phdrs {
+    for segment in elf_phdrs.iter() {
         // To filter, we need segments that are:
         // - Set to be LOADed.
         // - Have different virtual and physical addresses, meaning they are
         //   loaded into flash but actually reside in memory.
         // - Are not zero size in memory.
         // - Are writable (RAM should be writable).
-        if segment.progtype == elf::types::PT_LOAD
-            && segment.vaddr != segment.paddr
-            && segment.memsz > 0
-            && ((segment.flags.0 & elf::types::PF_W.0) > 0)
+        if segment.p_type == elf::abi::PT_LOAD
+            && segment.p_vaddr != segment.p_paddr
+            && segment.p_memsz > 0
+            && ((segment.p_flags & elf::abi::PF_W) > 0)
         {
-            minimum_ram_size += segment.memsz as u32;
+            minimum_ram_size += segment.p_memsz as u32;
         }
     }
     if verbose {
@@ -150,14 +175,17 @@ pub fn elf_to_tbf(
     /// This is necessary because we sometimes run into loadable segments that
     /// shouldn't really exist (they are at addresses outside of what was
     /// specified in the linker script), and we want to be able to skip them.
-    fn section_exists_in_segment(input: &elf::File, segment: &elf::types::ProgramHeader) -> bool {
-        let segment_start = segment.offset as u32;
-        let segment_size = segment.filesz as u32;
+    fn section_exists_in_segment(
+        shdrs: &[(String, elf::section::SectionHeader)],
+        segment: &elf::segment::ProgramHeader,
+    ) -> bool {
+        let segment_start = segment.p_offset as u32;
+        let segment_size = segment.p_filesz as u32;
         let segment_end = segment_start + segment_size;
 
-        for section in input.sections.iter() {
-            let section_start = section.shdr.offset as u32;
-            let section_size = section.shdr.size as u32;
+        for (_, shdr) in shdrs.iter() {
+            let section_start = shdr.sh_offset as u32;
+            let section_size = shdr.sh_size as u32;
             let section_end = section_start + section_size;
 
             if section_start >= segment_start && section_end <= segment_end && section_size > 0 {
@@ -172,24 +200,24 @@ pub fn elf_to_tbf(
     ///
     /// This is necessary because the flash segment is not guaranteed
     /// to start at the same address as the first section.
-    fn find_first_section_address_in_segment<'a>(
-        input: &'a elf::File,
-        segment: &elf::types::ProgramHeader,
+    fn find_first_section_address_in_segment(
+        shdrs: &[(String, elf::section::SectionHeader)],
+        segment: &elf::segment::ProgramHeader,
     ) -> Option<u32> {
-        let segment_start = segment.offset as u32;
-        let segment_size = segment.filesz as u32;
+        let segment_start = segment.p_offset as u32;
+        let segment_size = segment.p_filesz as u32;
         let segment_end = segment_start + segment_size;
 
         let mut first_section_address: Option<u32> = None;
-        for section in input.sections.iter() {
-            let section_start = section.shdr.offset as u32;
-            let section_size = section.shdr.size as u32;
+        for (_, shdr) in shdrs {
+            let section_start = shdr.sh_offset as u32;
+            let section_size = shdr.sh_size as u32;
             let section_end = section_start + section_size;
 
             if section_start >= segment_start && section_end <= segment_end && section_size > 0 {
                 first_section_address = match first_section_address {
-                    Some(first_address) => Some(cmp::min(first_address, section.shdr.addr as u32)),
-                    None => Some(section.shdr.addr as u32),
+                    Some(first_address) => Some(cmp::min(first_address, shdr.sh_addr as u32)),
+                    None => Some(shdr.sh_addr as u32),
                 };
             }
         }
@@ -197,56 +225,54 @@ pub fn elf_to_tbf(
     }
 
     // Do flash address.
-    for segment in &input.phdrs {
-        match segment.progtype {
-            elf::types::PT_LOAD => {
-                // Look for segments based on their flags, size, and whether
-                // they actually contain any valid sections. Flash segments have
-                // to be marked executable, and we only care about segments that
-                // actually contain data to be loaded into flash.
-                if (segment.flags.0 & elf::types::PF_X.0) > 0
-                    && segment.filesz > 0
-                    && section_exists_in_segment(input, segment)
-                {
-                    // If this is standard Tock PIC, then this virtual address
-                    // will be at 0x80000000. Otherwise, we interpret this to
-                    // mean that the binary was compiled for a fixed address in
-                    // flash. Once we confirm this we do not need to keep
-                    // checking.
-                    if segment.vaddr == 0x80000000 || fixed_address_flash_pic {
-                        fixed_address_flash_pic = true;
-                    } else {
-                        // We need to see if this segment represents the lowest
-                        // address in flash that we are going to specify this
-                        // app needs to be loaded at. To do this we compare this
-                        // segment to any previous and keep track of the lowest
-                        // address. However, we need to use the address of the
-                        // first _section_ in the segment, not just the address
-                        // of the segment, because a linker may insert padding.
-                        let segment_start = find_first_section_address_in_segment(input, segment);
+    for segment in elf_phdrs.iter() {
+        if segment.p_type != elf::abi::PT_LOAD {
+            continue;
+        }
 
-                        fixed_address_flash = match (fixed_address_flash, segment_start) {
-                            (Some(prev_addr), Some(segment_start)) => {
-                                // We already found a candidate, and we found a
-                                // new candidate. Keep looking for the lowest
-                                // address.
-                                Some(cmp::min(prev_addr, segment_start))
-                            }
-                            (None, Some(segment_start)) => {
-                                // We found our first valid segment and haven't set our
-                                // lowest address yet, so we do that now.
-                                Some(segment_start)
-                            }
-                            (prev_addr, None) => {
-                                // We can't use this segment, so skip.
-                                prev_addr
-                            }
-                        };
+        // Look for segments based on their flags, size, and whether
+        // they actually contain any valid sections. Flash segments have
+        // to be marked executable, and we only care about segments that
+        // actually contain data to be loaded into flash.
+        if (segment.p_flags & elf::abi::PF_X) > 0
+            && segment.p_filesz > 0
+            && section_exists_in_segment(&elf_shdrs, segment)
+        {
+            // If this is standard Tock PIC, then this virtual address
+            // will be at 0x80000000. Otherwise, we interpret this to
+            // mean that the binary was compiled for a fixed address in
+            // flash. Once we confirm this we do not need to keep
+            // checking.
+            if segment.p_vaddr == 0x80000000 || fixed_address_flash_pic {
+                fixed_address_flash_pic = true;
+            } else {
+                // We need to see if this segment represents the lowest
+                // address in flash that we are going to specify this
+                // app needs to be loaded at. To do this we compare this
+                // segment to any previous and keep track of the lowest
+                // address. However, we need to use the address of the
+                // first _section_ in the segment, not just the address
+                // of the segment, because a linker may insert padding.
+                let segment_start = find_first_section_address_in_segment(&elf_shdrs, segment);
+
+                fixed_address_flash = match (fixed_address_flash, segment_start) {
+                    (Some(prev_addr), Some(segment_start)) => {
+                        // We already found a candidate, and we found a
+                        // new candidate. Keep looking for the lowest
+                        // address.
+                        Some(cmp::min(prev_addr, segment_start))
                     }
-                }
+                    (None, Some(segment_start)) => {
+                        // We found our first valid segment and haven't set our
+                        // lowest address yet, so we do that now.
+                        Some(segment_start)
+                    }
+                    (prev_addr, None) => {
+                        // We can't use this segment, so skip.
+                        prev_addr
+                    }
+                };
             }
-
-            _ => {}
         }
     }
     // Use the flags to see if we got PIC sections, and clear any other fixed
@@ -256,46 +282,44 @@ pub fn elf_to_tbf(
     }
 
     // Do RAM address.
-    // Get all symbols in the symbol table section if it exists.
-    let section_symtab = input.sections.iter().find(|s| s.shdr.name == ".symtab");
-    section_symtab.map(|s_symtab| {
-        let symbols = input.get_symbols(s_symtab);
-        symbols.ok().map(|syms| {
-            // We are looking for the `_sram_origin` symbol and its value.
-            // If it exists, we try to use it. Otherwise, we just do not try
-            // to find a fixed RAM address.
-            let sram_origin_symbol = syms.iter().find(|sy| sy.name == "_sram_origin");
-            sram_origin_symbol.map(|sram_origin| {
-                let sram_origin_address = sram_origin.value as u32;
-                // If address does not match our dummy address for PIC, then we
-                // say this app has a fixed address for memory.
-                if sram_origin_address != 0x00000000 {
-                    fixed_address_ram = Some(sram_origin_address);
-                }
-            });
-        });
-    });
+    // Get the symbol table section if it exists.
+    if let Ok(Some((symtab, sym_strtab))) = input.symbol_table() {
+        // We are looking for the `_sram_origin` symbol and its value.
+        // If it exists, we try to use it. Otherwise, we just do not try
+        // to find a fixed RAM address.
+        if let Some(sram_origin) = symtab.iter().find(|sym| {
+            let name = sym_strtab
+                .get(sym.st_name as usize)
+                .expect("Failed to parse symbol name");
+            name == "_sram_origin"
+        }) {
+            let sram_origin_address = sram_origin.st_value as u32;
+            if sram_origin_address != 0x00000000 {
+                fixed_address_ram = Some(sram_origin_address);
+            }
+        }
+    }
 
     // Need an array of sections to look for relocation data to include.
-    let mut rel_sections: Vec<String> = Vec::new();
+    let mut rel_sections: Vec<&String> = Vec::new();
 
     // Iterate the sections in the ELF file to find properties of the app that
     // are required to go in the TBF header.
     let mut writeable_flash_regions_count = 0;
 
     for s in &sections_sort {
-        let section = &input.sections[s.0];
+        let (sh_name, shdr) = &elf_shdrs[s.0];
 
         // Count write only sections as writeable flash regions.
-        if section.shdr.name.contains(".wfr") && section.shdr.size > 0 {
+        if sh_name.contains(".wfr") && shdr.sh_size > 0 {
             writeable_flash_regions_count += 1;
         }
 
         // Check write+alloc sections for possible .rel.X sections.
-        if section.shdr.flags.0 == elf::types::SHF_WRITE.0 + elf::types::SHF_ALLOC.0 {
+        if shdr.sh_flags == (elf::abi::SHF_WRITE + elf::abi::SHF_ALLOC) as u64 {
             // This section is also one we might need to include relocation
             // data for.
-            rel_sections.push(section.shdr.name.clone());
+            rel_sections.push(sh_name);
         }
     }
     if verbose {
@@ -441,23 +465,22 @@ pub fn elf_to_tbf(
     // Iterate the sections in the ELF file. The sections are sorted in order of
     // offset. Add the sections we need to the binary.
     for s in &sections_sort {
-        let section = &input.sections[s.0];
+        let (sh_name, shdr) = &elf_shdrs[s.0];
 
         // If this is writeable, executable, or allocated, is nonzero length,
         // and is type `PROGBITS` we want to add it to the binary.
-        if (section.shdr.flags.0
-            & (elf::types::SHF_WRITE.0 + elf::types::SHF_EXECINSTR.0 + elf::types::SHF_ALLOC.0)
+        if (shdr.sh_flags
+            & (elf::abi::SHF_WRITE + elf::abi::SHF_EXECINSTR + elf::abi::SHF_ALLOC) as u64
             != 0)
-            && section.shdr.shtype == elf::types::SHT_PROGBITS
-            && section.shdr.size > 0
+            && shdr.sh_type == elf::abi::SHT_PROGBITS
+            && shdr.sh_size > 0
         {
             // This is a section we are going to add to the binary.
 
-            if last_section_address_end.is_some() {
+            if let Some(end) = last_section_address_end {
                 // We have a previous section. Now, check if there is any
                 // padding between the sections in the .elf.
-                let end = last_section_address_end.unwrap();
-                let start = section.shdr.addr as usize;
+                let start = shdr.sh_addr as usize;
 
                 // Because we have flash and ram memory regions, we have
                 // multiple address spaces. This check lets us assume we are in
@@ -483,7 +506,7 @@ pub fn elf_to_tbf(
                     } else {
                         println!(
                             "Warning! Padding to section {} is too large ({} bytes).",
-                            section.shdr.name, padding
+                            sh_name, padding
                         );
                     }
                 }
@@ -491,9 +514,9 @@ pub fn elf_to_tbf(
 
             // Determine if this is the section where the entry point is in. If it
             // is, then we need to calculate the correct init_fn_offset.
-            if input.ehdr.entry >= section.shdr.addr
-                && input.ehdr.entry < (section.shdr.addr + section.shdr.size)
-                && (section.shdr.name.find("debug")).is_none()
+            if input.ehdr.e_entry >= shdr.sh_addr
+                && input.ehdr.e_entry < (shdr.sh_addr + shdr.sh_size)
+                && !sh_name.contains("debug")
             {
                 // In the normal case, panic in case we detect entry point in
                 // multiple sections.
@@ -503,53 +526,57 @@ pub fn elf_to_tbf(
                     // points, so this allows us to load them.
                     if disabled {
                         if verbose {
-                            println!("Duplicate entry point in {} section", section.shdr.name);
+                            println!("Duplicate entry point in {sh_name} section");
                         }
                     } else {
-                        panic!("Duplicate entry point in {} section", section.shdr.name);
+                        panic!("Duplicate entry point in {sh_name} section");
                     }
                 }
                 entry_point_found = true;
 
                 if verbose {
-                    println!("Entry point is in {} section", section.shdr.name);
+                    println!("Entry point is in {sh_name} section");
                 }
                 // init_fn_offset is specified relative to the end of the TBF
                 // header.
-                init_fn_offset = (input.ehdr.entry - section.shdr.addr) as u32
+                init_fn_offset = (input.ehdr.e_entry - shdr.sh_addr) as u32
                     + (binary_index - header_length) as u32
             }
 
+            let sh_data = match input.section_data(shdr) {
+                Ok((sh_data, None)) => sh_data,
+                _ => {
+                    panic!("Cannot convert ELF file with compressed sections");
+                }
+            };
             if verbose {
                 println!(
                     "  Adding {0} section. Offset: {1} ({1:#x}). Length: {2} ({2:#x}) bytes.",
-                    section.shdr.name,
+                    sh_name,
                     binary_index,
-                    section.data.len(),
+                    sh_data.len(),
                 );
             }
             if amount_alignment_needed(binary_index as u32, 4) != 0 {
                 println!(
                     "Warning! Placing section {} at {:#x}, which is not 4-byte aligned.",
-                    section.shdr.name, binary_index
+                    sh_name, binary_index
                 );
             }
-            binary.extend(&section.data);
+            binary.extend(sh_data);
 
             // Check if this is a writeable flash region. If so, we need to
             // set the offset and size in the header.
-            if section.shdr.name.contains(".wfr") && section.shdr.size > 0 {
-                tbfheader.set_writeable_flash_region_values(
-                    binary_index as u32,
-                    section.shdr.size as u32,
-                );
+            if sh_name.contains(".wfr") && shdr.sh_size > 0 {
+                tbfheader
+                    .set_writeable_flash_region_values(binary_index as u32, shdr.sh_size as u32);
             }
 
             // Now increment where we are in the binary.
-            binary_index += section.shdr.size as usize;
+            binary_index += shdr.sh_size as usize;
 
             // And update our end in the .elf offset address space.
-            last_section_address_end = Some((section.shdr.addr + section.shdr.size) as usize);
+            last_section_address_end = Some((shdr.sh_addr + shdr.sh_size) as usize);
         }
     }
 
@@ -566,21 +593,24 @@ pub fn elf_to_tbf(
         println!("Searching for .rel.X sections to add.");
     }
     for relocation_section_name in &rel_sections {
-        let mut name: String = ".rel".to_owned();
-        name.push_str(relocation_section_name);
+        let rel_name: String = format!(".rel{relocation_section_name}");
 
-        let rel_data = input
-            .sections
+        let rel_data = elf_shdrs
             .iter()
-            .find(|section| section.shdr.name == name)
-            .map_or(&[] as &[u8], |section| section.data.as_ref());
+            .find(|(sh_name, _)| *sh_name == rel_name)
+            .map_or(&[] as &[u8], |(_, shdr)| match input.section_data(shdr) {
+                Ok((sh_data, None)) => sh_data,
+                _ => {
+                    panic!("Cannot convert ELF file with compressed relocation section");
+                }
+            });
 
         relocation_binary.extend(rel_data);
 
         if verbose && !rel_data.is_empty() {
             println!(
                 "  Adding {0} section. Offset: {1} ({1:#x}). Length: {2} ({2:#x}) bytes.",
-                name,
+                rel_name,
                 binary_index + mem::size_of::<u32>() + rel_data.len(),
                 rel_data.len(),
             );
@@ -588,7 +618,7 @@ pub fn elf_to_tbf(
         if !rel_data.is_empty() && amount_alignment_needed(binary_index as u32, 4) != 0 {
             println!(
                 "Warning! Placing section {} at {:#x}, which is not 4-byte aligned.",
-                name, binary_index
+                rel_name, binary_index
             );
         }
     }
